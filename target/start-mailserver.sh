@@ -25,6 +25,7 @@ DEFAULT_VARS["POSTGREY_AUTO_WHITELIST_CLIENTS"]="${POSTGREY_AUTO_WHITELIST_CLIEN
 DEFAULT_VARS["POSTGREY_TEXT"]="${POSTGREY_TEXT:="Delayed by postgrey"}"
 DEFAULT_VARS["POSTFIX_MESSAGE_SIZE_LIMIT"]="${POSTFIX_MESSAGE_SIZE_LIMIT:="10240000"}"  # ~10 MB by default
 DEFAULT_VARS["POSTFIX_MAILBOX_SIZE_LIMIT"]="${POSTFIX_MAILBOX_SIZE_LIMIT:="0"}"        # no limit by default
+DEFAULT_VARS["POSTFIX_INET_PROTOCOLS"]="${POSTFIX_INET_PROTOCOLS:="all"}"
 DEFAULT_VARS["ENABLE_SASLAUTHD"]="${ENABLE_SASLAUTHD:="0"}"
 DEFAULT_VARS["SMTP_ONLY"]="${SMTP_ONLY:="0"}"
 DEFAULT_VARS["DMS_DEBUG"]="${DMS_DEBUG:="0"}"
@@ -37,6 +38,7 @@ DEFAULT_VARS["SRS_SENDER_CLASSES"]="${SRS_SENDER_CLASSES:="envelope_sender"}"
 DEFAULT_VARS["REPORT_RECIPIENT"]="${REPORT_RECIPIENT:="0"}"
 DEFAULT_VARS["LOGROTATE_INTERVAL"]="${LOGROTATE_INTERVAL:=${REPORT_INTERVAL:-"daily"}}"
 DEFAULT_VARS["LOGWATCH_INTERVAL"]="${LOGWATCH_INTERVAL:="none"}"
+DEFAULT_VARS["SPAMASSASSIN_SPAM_TO_INBOX"]="${SPAMASSASSIN_SPAM_TO_INBOX:="0"}"
 DEFAULT_VARS["VIRUSMAILS_DELETE_DELAY"]="${VIRUSMAILS_DELETE_DELAY:="7"}"
 
 ##########################################################################
@@ -94,10 +96,6 @@ function register_functions() {
 	_register_setup_function "_setup_default_vars"
 	_register_setup_function "_setup_file_permissions"
 
-	if [ "$ENABLE_ELK_FORWARDER" = 1 ]; then
-		_register_setup_function "_setup_elk_forwarder"
-	fi
-
 	if [ "$SMTP_ONLY" != 1 ]; then
 		_register_setup_function "_setup_dovecot"
                 _register_setup_function "_setup_dovecot_dhparam"
@@ -118,6 +116,9 @@ function register_functions() {
 
 	_register_setup_function "_setup_dkim"
 	_register_setup_function "_setup_ssl"
+	if [ "$POSTFIX_INET_PROTOCOLS" != "all" ]; then
+    _register_setup_function "_setup_inet_protocols"
+  fi
 	_register_setup_function "_setup_docker_permit"
 
 	_register_setup_function "_setup_mailname"
@@ -175,7 +176,7 @@ function register_functions() {
 	if [ "$LOGWATCH_TRIGGER" != "none" ]; then
 		_register_setup_function "_setup_logwatch"
 	fi
-	
+
 	_register_setup_function "_setup_user_patches"
 
         # Compute last as the config files are modified in-place
@@ -206,10 +207,6 @@ function register_functions() {
 
 	_register_start_daemon "_start_daemons_cron"
 	_register_start_daemon "_start_daemons_rsyslog"
-
-	if [ "$ENABLE_ELK_FORWARDER" = 1 ]; then
-		_register_start_daemon "_start_daemons_filebeat"
-	fi
 
 	if [ "$SMTP_ONLY" != 1 ]; then
 		_register_start_daemon "_start_daemons_dovecot"
@@ -1100,6 +1097,11 @@ function _setup_postfix_vhost() {
 	fi
 }
 
+function _setup_inet_protocols() {
+  notify 'task' 'Setting up POSTFIX_INET_PROTOCOLS option'
+  postconf -e "inet_protocols = $POSTFIX_INET_PROTOCOLS"
+}
+
 function _setup_docker_permit() {
 	notify 'task' 'Setting up PERMIT_DOCKER Option'
 
@@ -1392,16 +1394,37 @@ function _setup_security_stack() {
 			sed -i -r 's/^\$sa_spam_subject_tag (.*);/\$sa_spam_subject_tag = '"'$SA_SPAM_SUBJECT'"';/g' /etc/amavis/conf.d/20-debian_defaults
 		fi
 
-        # activate short circuits when SA BAYES is certain it has spam.
+        # activate short circuits when SA BAYES is certain it has spam or ham.
         if [ "$SA_SHORTCIRCUIT_BAYES_SPAM" = 1 ]; then
+			# automatically activate the Shortcircuit Plugin
+			sed -i -r 's/^# loadplugin Mail::SpamAssassin::Plugin::Shortcircuit/loadplugin Mail::SpamAssassin::Plugin::Shortcircuit/g' /etc/spamassassin/v320.pre
             sed -i -r 's/^# shortcircuit BAYES_99/shortcircuit BAYES_99/g' /etc/spamassassin/local.cf
         fi
 
         if [ "$SA_SHORTCIRCUIT_BAYES_HAM" = 1 ]; then
+			# automatically activate the Shortcircuit Plugin
+			sed -i -r 's/^# loadplugin Mail::SpamAssassin::Plugin::Shortcircuit/loadplugin Mail::SpamAssassin::Plugin::Shortcircuit/g' /etc/spamassassin/v320.pre
             sed -i -r 's/^# shortcircuit BAYES_00/shortcircuit BAYES_00/g' /etc/spamassassin/local.cf
         fi
 
 		test -e /tmp/docker-mailserver/spamassassin-rules.cf && cp /tmp/docker-mailserver/spamassassin-rules.cf /etc/spamassassin/
+		
+		
+		if [ "$SPAMASSASSIN_SPAM_TO_INBOX" = "1" ]; then
+				notify 'inf' "Configure Spamassassin/Amavis to put SPAM inbox"
+				bannedbouncecheck=`egrep "final_banned_destiny.*D_BOUNCE" /etc/amavis/conf.d/20-debian_defaults`
+				  if [ -n "$bannedbouncecheck" ] ;
+						  then
+									   sed -i "/final_banned_destiny/ s|D_BOUNCE|D_REJECT|" /etc/amavis/conf.d/20-debian_defaults
+							fi
+							
+				finalbouncecheck=`egrep "final_spam_destiny.*D_BOUNCE" /etc/amavis/conf.d/20-debian_defaults`
+				  if [ -n "$finalbouncecheck" ] ;
+						  then
+									   sed -i "/final_spam_destiny/ s|D_BOUNCE|D_PASS|" /etc/amavis/conf.d/20-debian_defaults
+							fi
+		fi
+
 	fi
 
 	# Clamav
@@ -1413,7 +1436,7 @@ function _setup_security_stack() {
 	fi
 
 	echo "1;  # ensure a defined return" >> $dms_amavis_file
-
+	chmod 444 $dms_amavis_file
 
 	# Fail2ban
 	if [ "$ENABLE_FAIL2BAN" = 1 ]; then
@@ -1432,18 +1455,6 @@ function _setup_security_stack() {
 	if [ -f /tmp/docker-mailserver/amavis.cf ]; then
 		cp /tmp/docker-mailserver/amavis.cf /etc/amavis/conf.d/50-user
 	fi
-}
-
-function _setup_elk_forwarder() {
-	notify 'task' 'Setting up Elk forwarder'
-
-	ELK_PORT=${ELK_PORT:="5044"}
-	ELK_HOST=${ELK_HOST:="elk"}
-	notify 'inf' "Enabling log forwarding to ELK ($ELK_HOST:$ELK_PORT)"
-	cat /etc/filebeat/filebeat.yml.tmpl \
-		| sed "s@\$ELK_HOST@$ELK_HOST@g" \
-		| sed "s@\$ELK_PORT@$ELK_PORT@g" \
-		> /etc/filebeat/filebeat.yml
 }
 
 function _setup_logrotate() {
@@ -1730,11 +1741,6 @@ function _start_daemons_dovecot() {
 		#echo "Listing users"
 		#/usr/sbin/dovecot user '*'
 	#fi
-}
-
-function _start_daemons_filebeat() {
-	notify 'task' 'Starting filebeat' 'n'
-    supervisorctl start filebeat
 }
 
 function _start_daemons_fetchmail() {
